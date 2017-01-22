@@ -33,7 +33,7 @@
 #include "postgres.h"
 
 #include "access/clog.h"
-#include "access/slru.h"
+#include "access/nolru.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -68,14 +68,14 @@
 #define CLOG_XACTS_PER_LSN_GROUP	32	/* keep this a power of 2 */
 #define CLOG_LSNS_PER_PAGE	(CLOG_XACTS_PER_PAGE / CLOG_XACTS_PER_LSN_GROUP)
 
-#define GetLSNIndex(slotno, xid)	((slotno) * CLOG_LSNS_PER_PAGE + \
+#define GetLSNIndex(slotno, xid)	(((long)slotno) * CLOG_LSNS_PER_PAGE + \
 	((xid) % (TransactionId) CLOG_XACTS_PER_PAGE) / CLOG_XACTS_PER_LSN_GROUP)
 
 
 /*
  * Link to shared-memory data structures for CLOG control
  */
-static SlruCtlData ClogCtlData;
+static NolruCtlData ClogCtlData;
 
 #define ClogCtl (&ClogCtlData)
 
@@ -262,7 +262,7 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 		   status == TRANSACTION_STATUS_ABORTED ||
 		   (status == TRANSACTION_STATUS_SUB_COMMITTED && !TransactionIdIsValid(xid)));
 
-	LWLockAcquire(CLogControlLock, LW_EXCLUSIVE);
+	LWLockAcquire(CLogControlLock, LW_SHARED);
 
 	/*
 	 * If we're doing an async commit (ie, lsn is valid), then we must wait
@@ -273,7 +273,7 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 	 * write-busy, since we don't care if the update reaches disk sooner than
 	 * we think.
 	 */
-	slotno = SimpleLruReadPage(ClogCtl, pageno, XLogRecPtrIsInvalid(lsn), xid);
+	slotno = NoLruReadPage(ClogCtl, pageno, XLogRecPtrIsInvalid(lsn), xid);
 
 	/*
 	 * Set the main transaction id, if any.
@@ -311,6 +311,9 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 
 	ClogCtl->shared->page_dirty[slotno] = true;
 
+	if (PAGE_CMP_LT(ClogCtl->shared->head_page_number, slotno)) proceed_head(ClogCtl, slotno);
+	else if (PAGE_CMP_LT(slotno, ClogCtl->shared->tail_page_number)) update_tail(ClogCtl, slotno);
+	
 	LWLockRelease(CLogControlLock);
 }
 
@@ -324,11 +327,12 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 {
 	int			byteno = TransactionIdToByte(xid);
 	int			bshift = TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT;
+	int			lsnindex = GetLSNIndex(slotno, xid);
 	char	   *byteptr;
 	char		byteval;
 	char		curval;
 
-	byteptr = ClogCtl->shared->page_buffer[slotno] + byteno;
+	byteptr = ClogCtl->shared->page_buffer + (((long)slotno * BLCKSZ) + byteno);
 	curval = (*byteptr >> bshift) & CLOG_XACT_BITMASK;
 
 	/*
@@ -350,6 +354,7 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 			status != TRANSACTION_STATUS_IN_PROGRESS) ||
 		   curval == status);
 
+	SpinLockAcquire(&ClogCtl->shared->mutex[lsnindex & (NUM_CLOG_PARTITIONS - 1)]);
 	/* note this assumes exclusive access to the clog page */
 	byteval = *byteptr;
 	byteval &= ~(((1 << CLOG_BITS_PER_XACT) - 1) << bshift);
@@ -366,11 +371,10 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 	 */
 	if (!XLogRecPtrIsInvalid(lsn))
 	{
-		int			lsnindex = GetLSNIndex(slotno, xid);
-
 		if (ClogCtl->shared->group_lsn[lsnindex] < lsn)
 			ClogCtl->shared->group_lsn[lsnindex] = lsn;
 	}
+	SpinLockRelease(&ClogCtl->shared->mutex[lsnindex & (NUM_CLOG_PARTITIONS - 1)]);
 }
 
 /*
@@ -399,15 +403,16 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 	char	   *byteptr;
 	XidStatus	status;
 
-	/* lock is acquired by SimpleLruReadPage_ReadOnly */
+	/* lock is acquired by NoLruReadPage_ReadOnly */
 
-	slotno = SimpleLruReadPage_ReadOnly(ClogCtl, pageno, xid);
-	byteptr = ClogCtl->shared->page_buffer[slotno] + byteno;
-
-	status = (*byteptr >> bshift) & CLOG_XACT_BITMASK;
+	slotno = NoLruReadPage_ReadOnly(ClogCtl, pageno, xid);
+	byteptr = ClogCtl->shared->page_buffer + (((long)slotno * BLCKSZ) + byteno);
 
 	lsnindex = GetLSNIndex(slotno, xid);
+	SpinLockAcquire(&ClogCtl->shared->mutex[lsnindex & (NUM_CLOG_PARTITIONS - 1)]);
+	status = (*byteptr >> bshift) & CLOG_XACT_BITMASK;
 	*lsn = ClogCtl->shared->group_lsn[lsnindex];
+	SpinLockRelease(&ClogCtl->shared->mutex[lsnindex & (NUM_CLOG_PARTITIONS - 1)]);
 
 	LWLockRelease(CLogControlLock);
 
@@ -433,7 +438,7 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 Size
 CLOGShmemBuffers(void)
 {
-	return Min(128, Max(4, NBuffers / 512));
+	return (1LL << 31) / (CLOG_XACTS_PER_BYTE * BLCKSZ);
 }
 
 /*
@@ -442,14 +447,14 @@ CLOGShmemBuffers(void)
 Size
 CLOGShmemSize(void)
 {
-	return SimpleLruShmemSize(CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE);
+	return NoLruShmemSize(CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE);
 }
 
 void
 CLOGShmemInit(void)
 {
 	ClogCtl->PagePrecedes = CLOGPagePrecedes;
-	SimpleLruInit(ClogCtl, "clog", CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE,
+	NoLruInit(ClogCtl, "clog", CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE,
 				  CLogControlLock, "pg_clog", LWTRANCHE_CLOG_BUFFERS);
 }
 
@@ -470,7 +475,7 @@ BootStrapCLOG(void)
 	slotno = ZeroCLOGPage(0, false);
 
 	/* Make sure it's written out */
-	SimpleLruWritePage(ClogCtl, slotno);
+	NoLruWritePage(ClogCtl, slotno);
 	Assert(!ClogCtl->shared->page_dirty[slotno]);
 
 	LWLockRelease(CLogControlLock);
@@ -490,7 +495,7 @@ ZeroCLOGPage(int pageno, bool writeXlog)
 {
 	int			slotno;
 
-	slotno = SimpleLruZeroPage(ClogCtl, pageno);
+	slotno = NoLruZeroPage(ClogCtl, pageno);
 
 	if (writeXlog)
 		WriteZeroPageXlogRec(pageno);
@@ -514,6 +519,8 @@ StartupCLOG(void)
 	 * Initialize our idea of the latest page number.
 	 */
 	ClogCtl->shared->latest_page_number = pageno;
+	ClogCtl->shared->tail_page_number =
+		ClogCtl->shared->head_page_number = pageno;
 
 	LWLockRelease(CLogControlLock);
 }
@@ -533,6 +540,8 @@ TrimCLOG(void)
 	 * Re-Initialize our idea of the latest page number.
 	 */
 	ClogCtl->shared->latest_page_number = pageno;
+	ClogCtl->shared->tail_page_number =
+		ClogCtl->shared->head_page_number = pageno;
 
 	/*
 	 * Zero out the remainder of the current clog page.  Under normal
@@ -553,14 +562,15 @@ TrimCLOG(void)
 		int			slotno;
 		char	   *byteptr;
 
-		slotno = SimpleLruReadPage(ClogCtl, pageno, false, xid);
-		byteptr = ClogCtl->shared->page_buffer[slotno] + byteno;
+		slotno = NoLruReadPage(ClogCtl, pageno, false, xid);
+		byteptr = ClogCtl->shared->page_buffer + (((long)slotno * BLCKSZ) + byteno);
 
 		/* Zero so-far-unused positions in the current byte */
 		*byteptr &= (1 << bshift) - 1;
 		/* Zero the rest of the page */
 		MemSet(byteptr + 1, 0, BLCKSZ - byteno - 1);
 
+		update_tail(ClogCtl, slotno);
 		ClogCtl->shared->page_dirty[slotno] = true;
 	}
 
@@ -575,7 +585,7 @@ ShutdownCLOG(void)
 {
 	/* Flush dirty CLOG pages to disk */
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_START(false);
-	SimpleLruFlush(ClogCtl, false);
+	NoLruFlush(ClogCtl, false);
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE(false);
 }
 
@@ -587,7 +597,7 @@ CheckPointCLOG(void)
 {
 	/* Flush dirty CLOG pages to disk */
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_START(true);
-	SimpleLruFlush(ClogCtl, true);
+	NoLruFlush(ClogCtl, true);
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE(true);
 }
 
@@ -646,19 +656,19 @@ TruncateCLOG(TransactionId oldestXact)
 
 	/*
 	 * The cutoff point is the start of the segment containing oldestXact. We
-	 * pass the *page* containing oldestXact to SimpleLruTruncate.
+	 * pass the *page* containing oldestXact to NoLruTruncate.
 	 */
 	cutoffPage = TransactionIdToPage(oldestXact);
 
 	/* Check to see if there's any files that could be removed */
-	if (!SlruScanDirectory(ClogCtl, SlruScanDirCbReportPresence, &cutoffPage))
+	if (!NolruScanDirectory(ClogCtl, NolruScanDirCbReportPresence, &cutoffPage))
 		return;					/* nothing to remove */
 
 	/* Write XLOG record and flush XLOG to disk */
 	WriteTruncateXlogRec(cutoffPage);
 
 	/* Now we can remove the old CLOG segment(s) */
-	SimpleLruTruncate(ClogCtl, cutoffPage);
+	NoLruTruncate(ClogCtl, cutoffPage);
 }
 
 
@@ -735,7 +745,7 @@ clog_redo(XLogReaderState *record)
 		LWLockAcquire(CLogControlLock, LW_EXCLUSIVE);
 
 		slotno = ZeroCLOGPage(pageno, false);
-		SimpleLruWritePage(ClogCtl, slotno);
+		NoLruWritePage(ClogCtl, slotno);
 		Assert(!ClogCtl->shared->page_dirty[slotno]);
 
 		LWLockRelease(CLogControlLock);
@@ -748,11 +758,13 @@ clog_redo(XLogReaderState *record)
 
 		/*
 		 * During XLOG replay, latest_page_number isn't set up yet; insert a
-		 * suitable value to bypass the sanity test in SimpleLruTruncate.
+		 * suitable value to bypass the sanity test in NoLruTruncate.
 		 */
 		ClogCtl->shared->latest_page_number = pageno;
+		ClogCtl->shared->tail_page_number =
+			ClogCtl->shared->head_page_number = pageno;
 
-		SimpleLruTruncate(ClogCtl, pageno);
+		NoLruTruncate(ClogCtl, pageno);
 	}
 	else
 		elog(PANIC, "clog_redo: unknown op code %u", info);
