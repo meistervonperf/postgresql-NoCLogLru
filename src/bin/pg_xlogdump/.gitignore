@@ -1,0 +1,5 @@
+/pg_xlogdump
+# Source files copied from src/backend/access/rmgrdesc/
+/*desc.c
+!/rmgrdesc.c
+/xlogreader.c
