@@ -113,7 +113,6 @@ NoLruShmemSize(int nslots, int nlsns)
 	sz += MAXALIGN(nslots * sizeof(NolruPageStatus));	/* page_status[] */
 	sz += MAXALIGN(nslots * sizeof(bool));		/* page_dirty[] */
 	sz += MAXALIGN(nslots * sizeof(int));		/* page_number[] */
-	sz += MAXALIGN(nslots * sizeof(int));		/* page_lru_count[] */
 	sz += MAXALIGN(nslots * sizeof(LWLockPadded));		/* buffer_locks[] */
 
 	if (nlsns > 0)
@@ -157,6 +156,8 @@ NoLruInit(NolruCtl ctl, const char *name, int nslots, int nlsns,
 		offset += MAXALIGN(nslots * sizeof(NolruPageStatus));
 		shared->page_dirty = (bool *) (ptr + offset);
 		offset += MAXALIGN(nslots * sizeof(bool));
+		shared->page_number = (int *) (ptr + offset);
+		offset += MAXALIGN(nslots * sizeof(int));
 
 		if (nlsns > 0)
 		{
@@ -227,6 +228,7 @@ NoLruZeroPage(NolruCtl ctl, int pageno)
 		   shared->page_number[slotno] == pageno);
 
 	/* Mark the slot as containing this page */
+	shared->page_number[slotno] = pageno;
 	shared->page_status[slotno] = NOLRU_PAGE_VALID;
 	shared->page_dirty[slotno] = true;
 
@@ -339,7 +341,8 @@ NoLruReadPage(NolruCtl ctl, int pageno, bool write_ok,
 		slotno = NolruSelectLRUPage(ctl, pageno);
 
 		/* Did we find the page in memory? */
-		if (shared->page_status[slotno] != NOLRU_PAGE_EMPTY)
+		if (shared->page_number[slotno] == pageno &&
+			shared->page_status[slotno] != NOLRU_PAGE_EMPTY)
 		{
 			/*
 			 * If page is still being read in, we must wait for I/O.  Likewise
@@ -363,6 +366,7 @@ NoLruReadPage(NolruCtl ctl, int pageno, bool write_ok,
 				!shared->page_dirty[slotno]));
 
 		/* Mark the slot read-busy */
+		shared->page_number[slotno] = pageno;
 		shared->page_status[slotno] = NOLRU_PAGE_READ_IN_PROGRESS;
 		shared->page_dirty[slotno] = false;
 
@@ -417,19 +421,18 @@ NoLruReadPage_ReadOnly(NolruCtl ctl, int pageno, TransactionId xid)
 	NolruShared	shared = ctl->shared;
 	int			slotno;
 
-	/* Try to find the page while holding only shared lock */
-	LWLockAcquire(shared->ControlLock, LW_SHARED);
-
-	/* See if page is already in a buffer */
-	slotno = pageno;
-	if (shared->page_status[slotno] != NOLRU_PAGE_EMPTY &&
+	/* calculate the slotno from pageno */
+	slotno = pageno & (shared->num_slots - 1);
+	if (shared->page_number[slotno] == pageno &&
+		shared->page_status[slotno] != NOLRU_PAGE_EMPTY &&
 		shared->page_status[slotno] != NOLRU_PAGE_READ_IN_PROGRESS)
 	{
 		/* See comments for NolruRecentlyUsed macro */
 		return slotno;
 	}
 
-	/* No luck, so switch to normal exclusive lock and do regular read */
+	/* This should not happen in nolru!! */
+	elog(PANIC,"This should not happen!!");
 
 	return NoLruReadPage(ctl, pageno, true, xid);
 }
@@ -453,7 +456,8 @@ NolruInternalWritePage(NolruCtl ctl, int slotno, NolruFlush fdata)
 	bool		ok;
 
 	/* If a write is in progress, wait for it to finish */
-	while (shared->page_status[slotno] == NOLRU_PAGE_WRITE_IN_PROGRESS)
+	while (shared->page_status[slotno] == NOLRU_PAGE_WRITE_IN_PROGRESS &&
+		   shared->page_number[slotno] == pageno)
 	{
 		NoLruWaitIO(ctl, slotno);
 	}
@@ -463,7 +467,8 @@ NolruInternalWritePage(NolruCtl ctl, int slotno, NolruFlush fdata)
 	 * same page we were called for.
 	 */
 	if (!shared->page_dirty[slotno] ||
-		shared->page_status[slotno] != NOLRU_PAGE_VALID)
+		shared->page_status[slotno] != NOLRU_PAGE_VALID ||
+		shared->page_number[slotno] != pageno)
 		return;
 
 	/*
@@ -890,15 +895,15 @@ SpinLockTry(volatile slock_t *lock) { return !TAS_SPIN(lock); }
 static int
 NolruSelectLRUPage(NolruCtl ctl, int pageno)
 {
-	int slotno = pageno & ((1LL << 31) - 1);
+	int slotno = pageno & (ctl->shared->num_slots - 1);
 
 	proceed_head(ctl, pageno);
 	if (page_diff(ctl->shared->head_page_number, ctl->shared->tail_page_number) <= MAX_DIRTY_PAGES) return slotno;
 
 /*
  * 'ctl->shared->doing' is not for the purpose of spin lock.
- * It's just for a flag indicating whether some process is 
- * trying to invoke  NolruInternalWritePage().
+ * It's just for a flag indicating whether another process is 
+ * trying to invoke NolruInternalWritePage().
  */
 	if (SpinLockTry(&ctl->shared->doing)) {
 		uint tail;

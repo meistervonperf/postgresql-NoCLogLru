@@ -18,7 +18,6 @@
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 
-
 /*
  * Define NOLRU segment size.  A page is the same BLCKSZ as is used everywhere
  * else in Postgres.  The segment size can be chosen somewhat arbitrarily;
@@ -37,7 +36,6 @@
  * for 32-bit TransactionIds).
  */
 #define NOLRU_PAGES_PER_SEGMENT	32
-
 #define NUM_CLOG_PARTITIONS  32
 
 /* Maximum length of an NOLRU name */
@@ -75,7 +73,6 @@ typedef struct NolruSharedData
 	NolruPageStatus *page_status;
 	bool	   *page_dirty;
 	int		   *page_number;
-	int		   *page_lru_count;
 
 	/*
 	 * Optional array of WAL flush LSNs associated with entries in the NOLRU

@@ -58,6 +58,7 @@
 #define CLOG_XACTS_PER_BYTE 4
 #define CLOG_XACTS_PER_PAGE (BLCKSZ * CLOG_XACTS_PER_BYTE)
 #define CLOG_XACT_BITMASK	((1 << CLOG_BITS_PER_XACT) - 1)
+#define CLOG_NUM_XACT	(1LL << 31)
 
 #define TransactionIdToPage(xid)	((xid) / (TransactionId) CLOG_XACTS_PER_PAGE)
 #define TransactionIdToPgIndex(xid) ((xid) % (TransactionId) CLOG_XACTS_PER_PAGE)
@@ -414,8 +415,6 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 	*lsn = ClogCtl->shared->group_lsn[lsnindex];
 	SpinLockRelease(&ClogCtl->shared->mutex[lsnindex & (NUM_CLOG_PARTITIONS - 1)]);
 
-	LWLockRelease(CLogControlLock);
-
 	return status;
 }
 
@@ -438,7 +437,7 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 Size
 CLOGShmemBuffers(void)
 {
-	return (1LL << 31) / (CLOG_XACTS_PER_BYTE * BLCKSZ);
+	return CLOG_NUM_XACT / (CLOG_XACTS_PER_BYTE * BLCKSZ);
 }
 
 /*
